@@ -27,3 +27,18 @@ bin/
 
 ### Mac OS ###
 .DS_Store
+
+### Environment variables / secrets ###
+.env
+.env.*
+!.env.example
+
+### Java compiled files ###
+*.class
+out/
+
+.idea/
+*.iml
+
+*.log
+server_logs.txt
