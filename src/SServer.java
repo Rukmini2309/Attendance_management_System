@@ -1,320 +1,768 @@
 import java.io.*;
 import java.net.*;
 import java.sql.*;
+import java.time.LocalDate;
 
 public class SServer {
+
     private static final int PORT = 2400;
-    private static Connection connection;
+
+    // =========================
+    // AIVEN CONFIGURATION
+    // =========================
+
+    private static Connection db;
 
     public static void main(String[] args) {
-        initializeDatabase();
-
-        try (ServerSocket serverSocket = new ServerSocket(PORT)) {
-            System.out.println("Server started on port " + PORT);
-
-            while (true) {
-                Socket clientSocket = serverSocket.accept();
-                System.out.println("New client connected: " + clientSocket.getInetAddress());
-                new ClientHandler(clientSocket).start();
-            }
-        } catch (IOException e) {
-            System.err.println("Server error: " + e.getMessage());
-        }
-    }
-
-    private static void initializeDatabase() {
         try {
             Class.forName("com.mysql.cj.jdbc.Driver");
-            connection = DriverManager.getConnection(
-                    "jdbc:mysql://localhost:3306/school_db", "root", "jklmnopqr");
-            System.out.println("Database connection established");
-        } catch (Exception e) {
-            System.err.println("Database connection failed: " + e.getMessage());
-            System.exit(1);
-        }
-    }
 
-    private static synchronized void logActivity(String message) {
-        try (FileWriter fw = new FileWriter("server_logs.txt", true);
-             BufferedWriter bw = new BufferedWriter(fw);
-             PrintWriter out = new PrintWriter(bw)) {
-            out.println(message);
-        } catch (IOException e) {
-            System.err.println("Error logging activity: " + e.getMessage());
+            db = DatabaseConfig.getConnection();
+
+            System.out.println("Database connection established.");
+
+            CreateDatabase.ensureSchema(db);
+            CreateDatabase.initializeToday(db);
+
+            try (ServerSocket server = new ServerSocket(PORT)) {
+                System.out.println("Server started on port " + PORT);
+
+                while (true) {
+                    Socket socket = server.accept();
+                    System.out.println(
+                            "Client connected: " + socket.getRemoteSocketAddress()
+                    );
+                    new ClientHandler(socket).start();
+                }
+            }
+
+        } catch (Exception e) {
+            System.out.println("Server startup failed:");
+            e.printStackTrace();
         }
     }
 
     static class ClientHandler extends Thread {
-        private final Socket clientSocket;
-        private DataInputStream input;
-        private DataOutputStream output;
 
-        public ClientHandler(Socket socket) {
-            this.clientSocket = socket;
+        private final Socket socket;
+        private BufferedReader in;
+        private PrintWriter out;
+
+        private String username;
+        private String role;
+        private Integer studentId;
+
+        ClientHandler(Socket socket) {
+            this.socket = socket;
         }
 
+        @Override
         public void run() {
             try {
-                input = new DataInputStream(clientSocket.getInputStream());
-                output = new DataOutputStream(clientSocket.getOutputStream());
+                in = new BufferedReader(
+                        new InputStreamReader(socket.getInputStream())
+                );
+                out = new PrintWriter(socket.getOutputStream(), true);
 
-                while (true) { // Keep the connection alive for multiple operations
-                    String userType = input.readUTF();
+                String line;
 
-                    if (userType.equalsIgnoreCase("LOGIN")) {
-                        handleLogin(); // Handle login requests
-                    } else if (userType.equalsIgnoreCase("teacher")) {
-                        handleTeacher();
-                    } else if (userType.equalsIgnoreCase("student")) {
-                        handleStudent();
-                    } else {
-                        output.writeUTF("INVALID_USER_TYPE");
+                while ((line = in.readLine()) != null) {
+                    if ("LOGOUT".equals(line)) {
+                        out.println("BYE");
+                        break;
                     }
+
+                    String response = handle(line);
+                    out.println(response);
                 }
-            } catch (IOException | SQLException e) {
-                System.err.println("Client handler error: " + e.getMessage());
+
+            } catch (Exception e) {
+                System.out.println(
+                        "Client disconnected: " + e.getMessage()
+                );
             } finally {
-                closeResources();
-                System.out.println("Client disconnected: " + clientSocket.getInetAddress());
-            }
-        }
-
-        private void handleLogin() throws IOException, SQLException {
-            String role = input.readUTF();
-            String username = input.readUTF();
-            String password = input.readUTF();
-            System.out.println("Login attempt: Role=" + role + ", Username=" + username); // Debug message
-
-            String sql = "SELECT * FROM users WHERE role = ? AND username = ? AND password = ?";
-            try (PreparedStatement stmt = connection.prepareStatement(sql)) {
-                stmt.setString(1, role);
-                stmt.setString(2, username);
-                stmt.setString(3, password);
-                try (ResultSet rs = stmt.executeQuery()) {
-                    if (rs.next()) {
-                        output.writeUTF("SUCCESS");
-                        System.out.println("Login successful for user: " + username); // Debug message
-                    } else {
-                        output.writeUTF("FAILURE");
-                        System.out.println("Invalid credentials for user: " + username); // Debug message
-                    }
-                }
-            } catch (SQLException e) {
-                System.err.println("Error during login: " + e.getMessage());
-                output.writeUTF("ERROR");
-            }
-        }
-
-        private void handleTeacher() throws IOException, SQLException {
-            while (true) {
                 try {
-                    String command = input.readUTF();
-                    System.out.println("Received teacher command: " + command); // Debug log
-                    switch (command) {
-                        case "FETCH_SUMMARY":
-                            fetchAttendanceSummary();
-                            break;
-                        case "MARK_ATTENDANCE":
-                            int studentId = input.readInt();
-                            String attendanceStatus = input.readUTF();
-                            processAttendance(studentId, attendanceStatus);
-                            break;
-                        case "UPDATE_ATTENDANCE":  // Add this case
-                            updatePastAttendance();
-                            break;
-                        case "ADD_STUDENT":  // Add this case
-                            addNewStudent();
-                            break;
-                        case "teacher":
-                            sendStudentList();
-                            break;
-                        case "EXIT":
-                            System.out.println("Teacher exited."); // Debug log
-                            return;
-                        default:
-                            System.out.println("Invalid teacher command: " + command); // Debug log
-                            output.writeUTF("INVALID_COMMAND");
-                    }
-                } catch (IOException e) {
-                    System.err.println("Error handling teacher command: " + e.getMessage()); // Debug log
-                    break; // Exit the loop if there's an error
+                    socket.close();
+                } catch (Exception ignored) {
                 }
             }
         }
 
-        private void updatePastAttendance() throws IOException, SQLException {
-            int studentId = input.readInt();
-            String date = input.readUTF();
-            String status = input.readUTF();
-            String sql = "UPDATE attendance SET status = ? WHERE student_id = ? AND date = ?";
-            try (PreparedStatement stmt = connection.prepareStatement(sql)) {
-                stmt.setString(1, status);
-                stmt.setInt(2, studentId);
-                stmt.setString(3, date);
-                int rows = stmt.executeUpdate();
-                output.writeUTF(rows > 0 ? "Attendance updated successfully" : "Failed to update attendance");
-            } catch (SQLException e) {
-                System.err.println("Error updating attendance: " + e.getMessage());
-                output.writeUTF("Error updating attendance");
+        private String handle(String line) throws Exception {
+            String[] p = line.split("\\|", -1);
+
+            if (p.length == 0) return "ERROR|Invalid command";
+
+            return switch (p[0]) {
+                case "LOGIN" ->
+                        p.length >= 3
+                                ? login(p[1], p[2])
+                                : "ERROR|Invalid login request";
+
+                case "ATTEND" ->
+                        attendance(p.length > 1 ? p[1] : LocalDate.now().toString());
+
+                case "MARK" ->
+                        p.length >= 4
+                                ? mark(p[1], Integer.parseInt(p[2]), p[3])
+                                : "ERROR|Invalid attendance request";
+
+                case "ADD_STUDENT" ->
+                        p.length >= 4
+                                ? addStudent(p[1], p[2], p[3])
+                                : "ERROR|Invalid student request";
+
+                case "STUDENT_DETAILS" ->
+                        p.length >= 2
+                                ? studentDetails(Integer.parseInt(p[1]))
+                                : "ERROR|Invalid student";
+
+                case "TEACHERS" ->
+                        teachers();
+
+                case "REQUEST" ->
+                        p.length >= 4
+                                ? requestPermission(p[1], p[2], p[3])
+                                : "ERROR|Select a teacher and enter a reason";
+
+                case "MY_PERMISSION" ->
+                        myPermission();
+
+                case "PERMISSIONS" ->
+                        permissions();
+
+                case "PENDING_REQUESTS" ->
+                        pendingRequests();
+
+                case "GRANT" ->
+                        p.length >= 2
+                                ? permissionAction(Integer.parseInt(p[1]), true)
+                                : "ERROR|Invalid request";
+
+                case "REJECT" ->
+                        p.length >= 2
+                                ? permissionAction(Integer.parseInt(p[1]), false)
+                                : "ERROR|Invalid request";
+
+                default ->
+                        "ERROR|Unknown command";
+            };
+        }
+
+        private String login(String u, String pass) throws SQLException {
+            String sql = """
+                SELECT username,role,student_id
+                FROM users
+                WHERE username=? AND password=?
+            """;
+
+            try (PreparedStatement ps = db.prepareStatement(sql)) {
+                ps.setString(1, u);
+                ps.setString(2, pass);
+
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (!rs.next()) {
+                        return "LOGIN_FAIL|Invalid username or password";
+                    }
+
+                    username = rs.getString("username");
+                    role = rs.getString("role");
+
+                    int sid = rs.getInt("student_id");
+                    studentId = rs.wasNull() ? null : sid;
+
+                    return "LOGIN_OK|" + role + "|" + username + "|"
+                            + (studentId == null ? "" : studentId);
+                }
             }
         }
 
-        private void addNewStudent() throws IOException, SQLException {
-            String studentName = input.readUTF();
-            String sql = "INSERT INTO students (name) VALUES (?)";
-            try (PreparedStatement stmt = connection.prepareStatement(sql)) {
-                stmt.setString(1, studentName);
-                int rows = stmt.executeUpdate();
-                String response = rows > 0 ? "Student added successfully: " + studentName : "Failed to add student";
-                output.writeUTF(response); // Send response to client
-                System.out.println(response); // Debug message
-            } catch (SQLException e) {
-                String error = "Error adding new student: " + e.getMessage();
-                System.err.println(error);
-                output.writeUTF(error); // Send error response to client
-            }
-        }
+        private String attendance(String requestedDate) throws SQLException {
+            LocalDate date;
 
-        private void fetchAttendanceSummary() throws IOException, SQLException {
-            String date = input.readUTF();
-            String sql = "SELECT s.name, a.status FROM attendance a " +
-                    "JOIN students s ON a.student_id = s.id " +
-                    "WHERE a.date = ?";
-            try (PreparedStatement stmt = connection.prepareStatement(sql)) {
-                stmt.setString(1, date);
-                try (ResultSet rs = stmt.executeQuery()) {
-                    StringBuilder response = new StringBuilder();
+            try {
+                date = LocalDate.parse(requestedDate);
+            } catch (Exception e) {
+                return "ERROR|Invalid date. Use YYYY-MM-DD.";
+            }
+
+            // If today's date is requested, ensure every student has
+            // an automatic PRESENT record.
+            if (date.equals(LocalDate.now())) {
+                CreateDatabase.initializeToday(db);
+            }
+
+            StringBuilder b = new StringBuilder("ATTEND_OK|").append(date);
+
+            String sql = """
+                SELECT
+                    s.id,
+                    s.name,
+                    COALESCE(a.status,'NOT_SET') AS status,
+                    COALESCE(a.marked_by,'-') AS marked_by,
+                    COALESCE((
+                        SELECT ROUND(
+                            100.0 * SUM(
+                                CASE WHEN aa.status='PRESENT' THEN 1 ELSE 0 END
+                            ) / NULLIF(COUNT(*),0), 1
+                        )
+                        FROM attendance aa
+                        WHERE aa.student_id=s.id
+                          AND aa.date <= CURDATE()
+                          AND aa.status IN ('PRESENT','ABSENT')
+                    ),0) AS percent
+                FROM students s
+                LEFT JOIN attendance a
+                  ON a.student_id=s.id
+                 AND a.date=?
+                WHERE (? <> 'Student') OR s.id=?
+                ORDER BY s.id
+            """;
+
+            try (PreparedStatement ps = db.prepareStatement(sql)) {
+                ps.setDate(1, Date.valueOf(date));
+                ps.setString(2, role);
+                ps.setInt(3, studentId == null ? -1 : studentId);
+
+                try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
-                        response.append(rs.getString("name")).append(",")
-                                .append(rs.getString("status")).append("|");
+                        b.append("|")
+                                .append(rs.getInt("id")).append(",")
+                                .append(clean(rs.getString("name"))).append(",")
+                                .append(rs.getString("status")).append(",")
+                                .append(clean(rs.getString("marked_by"))).append(",")
+                                .append(rs.getString("percent")).append("%");
                     }
-                    if (response.length() == 0) {
-                        response.append("No records found for the date: ").append(date);
-                    }
-                    output.writeUTF(response.toString());
-                    logActivity("Teacher fetched attendance summary for date: " + date);
                 }
-            } catch (SQLException e) {
-                System.err.println("Error fetching attendance summary: " + e.getMessage());
-                output.writeUTF("ERROR_FETCHING_SUMMARY");
+            }
+
+            return b.toString();
+        }
+
+        private String mark(String dateText, int sid, String status)
+                throws SQLException {
+
+            LocalDate date;
+
+            try {
+                date = LocalDate.parse(dateText);
+            } catch (Exception e) {
+                return "ERROR|Invalid date";
+            }
+
+            if ("Student".equalsIgnoreCase(role)) {
+                return "ERROR|Students cannot edit attendance";
+            }
+
+            if ("CR".equalsIgnoreCase(role)) {
+                if (!date.equals(LocalDate.now())) {
+                    return "ERROR|CR can edit only today's attendance.";
+                }
+
+                if (!hasCrPermission()) {
+                    return "ERROR|Teacher permission is required first.";
+                }
+            } else if (!"Teacher".equalsIgnoreCase(role)) {
+                return "ERROR|Not authorized";
+            }
+
+            if (!status.equals("PRESENT") && !status.equals("ABSENT")) {
+                return "ERROR|Status must be PRESENT or ABSENT";
+            }
+
+            String sql = """
+                INSERT INTO attendance(student_id,date,status,marked_by)
+                VALUES (?,?,?,?)
+                ON DUPLICATE KEY UPDATE
+                    status=VALUES(status),
+                    marked_by=VALUES(marked_by)
+            """;
+
+            try (PreparedStatement ps = db.prepareStatement(sql)) {
+                ps.setInt(1, sid);
+                ps.setDate(2, Date.valueOf(date));
+                ps.setString(3, status);
+                ps.setString(4, username);
+                ps.executeUpdate();
+            }
+
+            return "OK|Attendance updated successfully";
+        }
+
+        private String addStudent(
+                String name, String studentUsername, String studentPassword)
+                throws SQLException {
+
+            if (!"Teacher".equalsIgnoreCase(role)) {
+                return "ERROR|Only a teacher can add students";
+            }
+
+            name = cleanInput(name);
+            studentUsername = cleanInput(studentUsername);
+            studentPassword = cleanInput(studentPassword);
+
+            if (name.isBlank() || studentUsername.isBlank()
+                    || studentPassword.isBlank()) {
+                return "ERROR|Name, username and password are required";
+            }
+
+            db.setAutoCommit(false);
+
+            try {
+                int sid;
+
+                try (PreparedStatement ps = db.prepareStatement(
+                        "SELECT id FROM students WHERE name=? LIMIT 1")) {
+                    ps.setString(1, name);
+
+                    try (ResultSet rs = ps.executeQuery()) {
+                        if (rs.next()) {
+                            db.rollback();
+                            return "ERROR|A student with this name already exists";
+                        }
+                    }
+                }
+
+                try (PreparedStatement ps = db.prepareStatement(
+                        "SELECT id FROM users WHERE username=? LIMIT 1")) {
+                    ps.setString(1, studentUsername);
+
+                    try (ResultSet rs = ps.executeQuery()) {
+                        if (rs.next()) {
+                            db.rollback();
+                            return "ERROR|This username already exists";
+                        }
+                    }
+                }
+
+                try (PreparedStatement ps = db.prepareStatement(
+                        "INSERT INTO students(name) VALUES (?)",
+                        Statement.RETURN_GENERATED_KEYS)) {
+
+                    ps.setString(1, name);
+                    ps.executeUpdate();
+
+                    try (ResultSet rs = ps.getGeneratedKeys()) {
+                        if (!rs.next()) {
+                            db.rollback();
+                            return "ERROR|Could not create student";
+                        }
+                        sid = rs.getInt(1);
+                    }
+                }
+
+                try (PreparedStatement ps = db.prepareStatement(
+                        "INSERT INTO users(username,password,role,student_id) "
+                                + "VALUES (?,?, 'Student',?)")) {
+
+                    ps.setString(1, studentUsername);
+                    ps.setString(2, studentPassword);
+                    ps.setInt(3, sid);
+                    ps.executeUpdate();
+                }
+
+                db.commit();
+
+                // New students are also automatically PRESENT today.
+                CreateDatabase.initializeToday(db);
+
+                return "OK|Student added successfully";
+
+            } catch (Exception e) {
+                try {
+                    db.rollback();
+                } catch (Exception ignored) {
+                }
+
+                return "ERROR|Could not add student: " + clean(e.getMessage());
+
+            } finally {
+                db.setAutoCommit(true);
             }
         }
 
-        private void sendStudentList() throws SQLException, IOException {
-            System.out.println("Sending student list to client..."); // Debug log
-            StringBuilder response = new StringBuilder();
-            String query = "SELECT id, name FROM students";
+        private String studentDetails(int requestedStudentId)
+                throws SQLException {
 
-            try (Statement stmt = connection.createStatement();
-                 ResultSet rs = stmt.executeQuery(query)) {
+            if ("Student".equalsIgnoreCase(role)
+                    && !Integer.valueOf(requestedStudentId).equals(studentId)) {
+                return "ERROR|Students can view only their own attendance";
+            }
+
+            StringBuilder b = new StringBuilder("DETAILS_OK");
+
+            String summarySql = """
+                SELECT
+                    s.id,
+                    s.name,
+                    COALESCE(SUM(CASE WHEN a.status='PRESENT' THEN 1 ELSE 0 END),0) present_count,
+                    COALESCE(SUM(CASE WHEN a.status='ABSENT' THEN 1 ELSE 0 END),0) absent_count,
+                    COALESCE(SUM(
+                        CASE WHEN a.status IN ('PRESENT','ABSENT') THEN 1 ELSE 0 END
+                    ),0) marked_count,
+                    COALESCE(ROUND(
+                        100.0 * SUM(CASE WHEN a.status='PRESENT' THEN 1 ELSE 0 END)
+                        / NULLIF(SUM(
+                            CASE WHEN a.status IN ('PRESENT','ABSENT') THEN 1 ELSE 0 END
+                        ),0),1
+                    ),0) percent
+                FROM students s
+                LEFT JOIN attendance a
+                  ON a.student_id=s.id
+                 AND a.date <= CURDATE()
+                WHERE s.id=?
+                GROUP BY s.id,s.name
+            """;
+
+            try (PreparedStatement ps = db.prepareStatement(summarySql)) {
+                ps.setInt(1, requestedStudentId);
+
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (!rs.next()) {
+                        return "ERROR|Student not found";
+                    }
+
+                    b.append("|")
+                            .append(rs.getInt("id")).append(",")
+                            .append(clean(rs.getString("name"))).append(",")
+                            .append(rs.getInt("present_count")).append(",")
+                            .append(rs.getInt("absent_count")).append(",")
+                            .append(rs.getInt("marked_count")).append(",")
+                            .append(rs.getString("percent")).append("%");
+                }
+            }
+
+            String historySql = """
+                SELECT date,status,COALESCE(marked_by,'-')
+                FROM attendance
+                WHERE student_id=?
+                  AND date <= CURDATE()
+                  AND status IN ('PRESENT','ABSENT')
+                ORDER BY date DESC
+            """;
+
+            try (PreparedStatement ps = db.prepareStatement(historySql)) {
+                ps.setInt(1, requestedStudentId);
+
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        b.append("|H,")
+                                .append(rs.getDate(1)).append(",")
+                                .append(rs.getString(2)).append(",")
+                                .append(clean(rs.getString(3)));
+                    }
+                }
+            }
+
+            return b.toString();
+        }
+
+        private String teachers() throws SQLException {
+            if (!"CR".equalsIgnoreCase(role)) {
+                return "ERROR|Only CR can select a teacher";
+            }
+
+            StringBuilder b = new StringBuilder("TEACHERS_OK");
+
+            try (PreparedStatement ps = db.prepareStatement(
+                    "SELECT username FROM users WHERE role='Teacher' ORDER BY username");
+                 ResultSet rs = ps.executeQuery()) {
 
                 while (rs.next()) {
-                    response.append(rs.getInt("id")).append(",")
-                            .append(rs.getString("name")).append("|");
+                    b.append("|").append(clean(rs.getString(1)));
                 }
-
-                if (response.length() == 0) {
-                    response.append("No students found");
-                }
-
-                output.writeUTF(response.toString());
-                System.out.println("Student list sent to client."); // Debug log
-            } catch (SQLException e) {
-                System.err.println("Error fetching student list: " + e.getMessage()); // Debug log
-                output.writeUTF("ERROR_FETCHING_STUDENT_LIST");
             }
+
+            return b.toString();
         }
 
-        private synchronized void processAttendance(int studentId, String attendanceStatus)
-                throws SQLException, IOException {
-            String checkSql = "SELECT status FROM attendance WHERE student_id = ? AND date = CURDATE()";
-            try (PreparedStatement checkStmt = connection.prepareStatement(checkSql)) {
-                checkStmt.setInt(1, studentId);
-                try (ResultSet rs = checkStmt.executeQuery()) {
-                    if (rs.next()) {
-                        String existingStatus = rs.getString("status");
-                        output.writeUTF("CONFLICT:" + existingStatus);
+        private String requestPermission(
+                String dateText, String teacher, String reason)
+                throws SQLException {
 
-                        // Normalize decision to uppercase
-                        String decision = input.readUTF().toUpperCase();
-
-                        if ("YES".equals(decision)) {
-                            updateAttendance(studentId, attendanceStatus);
-                            output.writeUTF("UPDATED"); // Single success response
-                        } else {
-                            output.writeUTF("CANCELLED");
-                        }
-                    } else {
-                        insertAttendance(studentId, attendanceStatus);
-                    }
-                }
-            } catch (SQLException e) {
-                String error = "Error processing attendance: " + e.getMessage();
-                System.err.println(error);
-                output.writeUTF(error);
+            if (!"CR".equalsIgnoreCase(role)) {
+                return "ERROR|Only CR can request edit permission";
             }
-        }
 
-        private void updateAttendance(int studentId, String status) throws SQLException, IOException {
-            String sql = "UPDATE attendance SET status = ? WHERE student_id = ? AND date = CURDATE()";
-            try (PreparedStatement stmt = connection.prepareStatement(sql)) {
-                stmt.setString(1, status);
-                stmt.setInt(2, studentId);
-                stmt.executeUpdate(); // Don't send response here - handled in processAttendance
-            }
-        }
-        private void insertAttendance(int studentId, String status) throws SQLException, IOException {
-            String sql = "INSERT INTO attendance (student_id, date, status) VALUES (?, CURDATE(), ?)";
-            try (PreparedStatement stmt = connection.prepareStatement(sql)) {
-                stmt.setInt(1, studentId);
-                stmt.setString(2, status);
-                int rows = stmt.executeUpdate();
-                String response = rows > 0 ? "Attendance recorded successfully for Student ID: " + studentId
-                        : "Failed to record attendance";
-                output.writeUTF(response); // Send response to client
-                System.out.println(response); // Debug message
-            }
-        }
+            LocalDate date;
 
-        private void handleStudent() throws IOException, SQLException {
-            int studentId = input.readInt();
-
-            String sql = "SELECT s.name, a.date, a.status " +
-                    "FROM attendance a " +
-                    "JOIN students s ON a.student_id = s.id " +
-                    "WHERE a.student_id = ? " +
-                    "ORDER BY a.date DESC";
-
-            try (PreparedStatement stmt = connection.prepareStatement(sql)) {
-                stmt.setInt(1, studentId);
-                try (ResultSet rs = stmt.executeQuery()) {
-                    StringBuilder response = new StringBuilder();
-                    while (rs.next()) {
-                        response.append(rs.getString("name")).append(",")
-                                .append(rs.getString("date")).append(",")  // Use getString instead of getDate
-                                .append(rs.getString("status")).append("|");
-                 }
-
-                    if (response.length() == 0) {
-                        response.append("No records found");
-                    }
-
-                    output.writeUTF(response.toString());
-                }
-            } catch (SQLException e) {
-                System.err.println("Error fetching attendance records: " + e.getMessage());
-                output.writeUTF("ERROR_FETCHING_RECORDS");
-            }
-        }
-
-        private void closeResources() {
             try {
-                if (input != null) input.close();
-                if (output != null) output.close();
-                if (clientSocket != null) clientSocket.close();
-            } catch (IOException e) {
-                System.err.println("Error closing resources: " + e.getMessage());
+                date = LocalDate.parse(dateText);
+            } catch (Exception e) {
+                return "ERROR|Invalid date";
             }
+
+            if (!date.equals(LocalDate.now())) {
+                return "ERROR|CR can request permission only for today.";
+            }
+
+            teacher = cleanInput(teacher);
+            reason = cleanInput(reason);
+
+            if (teacher.isBlank()) {
+                return "ERROR|Select a teacher";
+            }
+
+            if (reason.isBlank()) {
+                return "ERROR|Enter a reason";
+            }
+
+            String check = """
+                SELECT username FROM users
+                WHERE username=? AND role='Teacher'
+            """;
+
+            try (PreparedStatement ps = db.prepareStatement(check)) {
+                ps.setString(1, teacher);
+
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (!rs.next()) {
+                        return "ERROR|Selected teacher does not exist";
+                    }
+                }
+            }
+
+            // Do not allow duplicate active requests for the same CR/date/teacher.
+            String duplicateCheck = """
+                SELECT COUNT(*) FROM cr_attendance_permissions
+                WHERE cr_username=? AND teacher_username=?
+                  AND permission_date=?
+                  AND status IN ('PENDING','GRANTED')
+            """;
+            try (PreparedStatement ps = db.prepareStatement(duplicateCheck)) {
+                ps.setString(1, username);
+                ps.setString(2, teacher);
+                ps.setDate(3, Date.valueOf(date));
+                try (ResultSet rs = ps.executeQuery()) {
+                    rs.next();
+                    if (rs.getInt(1) > 0) {
+                        return "ERROR|You already have an active request or permission for this teacher today.";
+                    }
+                }
+            }
+
+            String sql = """
+                INSERT INTO cr_attendance_permissions
+                (cr_username,teacher_username,permission_date,reason,status)
+                VALUES (?,?,?,?, 'PENDING')
+            """;
+
+            try (PreparedStatement ps = db.prepareStatement(sql)) {
+                ps.setString(1, username);
+                ps.setString(2, teacher);
+                ps.setDate(3, Date.valueOf(date));
+                ps.setString(4, reason);
+                ps.executeUpdate();
+            } catch (SQLIntegrityConstraintViolationException e) {
+                return "ERROR|You already have a request for this teacher today.";
+            }
+
+            return "OK|Edit request sent to " + teacher;
+        }
+
+        private String myPermission() throws SQLException {
+            if (!"CR".equalsIgnoreCase(role)) {
+                return "ERROR|Only CR can check permission";
+            }
+
+            StringBuilder b = new StringBuilder("MY_PERMISSION");
+
+            String sql = """
+                SELECT id,teacher_username,permission_date,reason,status,
+                       requested_at,granted_by,granted_at
+                FROM cr_attendance_permissions
+                WHERE cr_username=?
+                  AND permission_date=CURDATE()
+                ORDER BY id DESC
+                LIMIT 1
+            """;
+
+            try (PreparedStatement ps = db.prepareStatement(sql)) {
+                ps.setString(1, username);
+
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (!rs.next()) {
+                        return "MY_PERMISSION|NONE";
+                    }
+
+                    b.append("|")
+                            .append(rs.getInt("id")).append(",")
+                            .append(clean(rs.getString("teacher_username"))).append(",")
+                            .append(rs.getDate("permission_date")).append(",")
+                            .append(clean(rs.getString("reason"))).append(",")
+                            .append(rs.getString("status")).append(",")
+                            .append(rs.getTimestamp("requested_at")).append(",")
+                            .append(clean(rs.getString("granted_by"))).append(",")
+                            .append(rs.getTimestamp("granted_at"));
+                }
+            }
+
+            return b.toString();
+        }
+
+        private String permissions() throws SQLException {
+            if (!"Teacher".equalsIgnoreCase(role)) {
+                return "ERROR|Only teacher can view permission requests";
+            }
+
+            StringBuilder b = new StringBuilder("PERMISSIONS_OK");
+
+            String sql = """
+                SELECT id,cr_username,permission_date,reason,status,
+                       requested_at
+                FROM cr_attendance_permissions
+                WHERE teacher_username=?
+                  AND permission_date=CURDATE()
+                ORDER BY requested_at DESC
+            """;
+
+            try (PreparedStatement ps = db.prepareStatement(sql)) {
+                ps.setString(1, username);
+
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        b.append("|")
+                                .append(rs.getInt("id")).append(",")
+                                .append(clean(rs.getString("cr_username"))).append(",")
+                                .append(rs.getDate("permission_date")).append(",")
+                                .append(clean(rs.getString("reason"))).append(",")
+                                .append(rs.getString("status")).append(",")
+                                .append(rs.getTimestamp("requested_at"));
+                    }
+                }
+            }
+
+            return b.toString();
+        }
+
+        private String pendingRequests() throws SQLException {
+            if (!"Teacher".equalsIgnoreCase(role)) {
+                return "ERROR|Only teacher can view pending requests";
+            }
+
+            StringBuilder b = new StringBuilder("PENDING_OK");
+
+            String sql = """
+                SELECT id,cr_username,requested_at
+                FROM cr_attendance_permissions
+                WHERE teacher_username=?
+                  AND permission_date=CURDATE()
+                  AND status='PENDING'
+                ORDER BY requested_at DESC
+            """;
+
+            try (PreparedStatement ps = db.prepareStatement(sql)) {
+                ps.setString(1, username);
+
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        b.append("|")
+                                .append(rs.getInt(1)).append(",")
+                                .append(clean(rs.getString(2))).append(",")
+                                .append(rs.getTimestamp(3));
+                    }
+                }
+            }
+
+            return b.toString();
+        }
+
+        private String permissionAction(int requestId, boolean grant)
+                throws SQLException {
+
+            if (!"Teacher".equalsIgnoreCase(role)) {
+                return "ERROR|Only teacher can approve/reject requests";
+            }
+
+            String sql;
+
+            if (grant) {
+                sql = """
+                    UPDATE cr_attendance_permissions
+                    SET status='GRANTED',
+                        granted_by=?,
+                        granted_at=CURRENT_TIMESTAMP,
+                        rejected_at=NULL
+                    WHERE id=?
+                      AND teacher_username=?
+                      AND status='PENDING'
+                """;
+            } else {
+                sql = """
+                    UPDATE cr_attendance_permissions
+                    SET status='REJECTED',
+                        granted_by=?,
+                        rejected_at=CURRENT_TIMESTAMP
+                    WHERE id=?
+                      AND teacher_username=?
+                      AND status='PENDING'
+                """;
+            }
+
+            try (PreparedStatement ps = db.prepareStatement(sql)) {
+                ps.setString(1, username);
+                ps.setInt(2, requestId);
+                ps.setString(3, username);
+
+                int n = ps.executeUpdate();
+
+                if (n == 0) {
+                    return "ERROR|Request not found or already processed";
+                }
+            }
+
+            return grant
+                    ? "OK|CR edit permission granted for today"
+                    : "OK|CR request rejected";
+        }
+
+        private boolean hasCrPermission() throws SQLException {
+            String sql = """
+                SELECT COUNT(*)
+                FROM cr_attendance_permissions
+                WHERE cr_username=?
+                  AND teacher_username IN (
+                      SELECT username FROM users
+                      WHERE username=?
+                        AND role='Teacher'
+                  )
+                  AND permission_date=CURDATE()
+                  AND status='GRANTED'
+            """;
+
+            // The logged-in CR is allowed if ANY teacher granted
+            // the request for today's date.
+            sql = """
+                SELECT COUNT(*)
+                FROM cr_attendance_permissions
+                WHERE cr_username=?
+                  AND permission_date=CURDATE()
+                  AND status='GRANTED'
+            """;
+
+            try (PreparedStatement ps = db.prepareStatement(sql)) {
+                ps.setString(1, username);
+
+                try (ResultSet rs = ps.executeQuery()) {
+                    rs.next();
+                    return rs.getInt(1) > 0;
+                }
+            }
+        }
+
+        private String cleanInput(String s) {
+            if (s == null) return "";
+            return s.replace("|", "/")
+                    .replace(",", " ")
+                    .replace("\n", " ")
+                    .trim();
+        }
+
+        private String clean(String s) {
+            if (s == null) return "-";
+            return s.replace("|", "/")
+                    .replace(",", " ")
+                    .replace("\n", " ");
         }
     }
 }
